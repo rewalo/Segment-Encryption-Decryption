@@ -12,8 +12,6 @@
 #include <cassert>
 #include "SED.h"
 
-#define SED_MODE SED_MODE_TRAMPOLINE // Switch between VEH and TRAMPOLINE modes here
-
 #pragma region Math Stuff
 __declspec(noinline) int factorial(int n) {
     return (n <= 1) ? 1 : n * factorial(n - 1);
@@ -203,7 +201,8 @@ int main() {
 
     //run_concurrent_same(/*threads*/ 8, /*iters_per_thread*/ 200);
     //run_concurrent_mixed(/*threads*/ 8, /*iters_per_thread*/ 200);
-    //run_break_reencrypt_churn(/*threads*/ 8, /*iters_per_thread*/ 200); // Man I don't even know why this race condition exists T~T
+
+    //run_break_reencrypt_churn(/*threads*/ 8, /*iters_per_thread*/ 200);
 
     //system("pause");
 
