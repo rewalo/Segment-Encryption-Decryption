@@ -11,19 +11,17 @@ All credit for the original concept and proof-of-concept implementation goes to 
 
 ## What Is SED?
 
-SED protects code by dynamically encrypting and decrypting functions in memory at runtime.  
-Core features include:
+SED protects sensitive code by dynamically encrypting and decrypting functions in memory at runtime. This project enhances the original with:
 
-- **Modern C++ design** - strong typing, atomics, and thread-local call stacks.  
+- **Modern C++ design** - replaces global C-style data with typed structures, atomics, and thread-local storage and call stacks.
 - **Full thread safety** - no data races under concurrent execution.  
 - **Lock-free global state** - immutable table publication (RCU-style).  
 - **Fast runtime** - decrypt–execute–relock cycles complete in microseconds.  
 - **Stealth wipe** - functions are cleared with randomized `UD2` sleds + junk bytes instead of static illegal opcodes.  
 - **Per-cycle re-randomization** - every wipe differs (no stable memory signature).  
 - **Stash relocation** - the encrypted backup moves to a new memory region after each re-lock cycle.  
-- **Epoch-based GC** - old stash pages and old function tables are safely reclaimed after a grace period; zero leaks, zero UAFs.  
+- **Garbage Collection** - old stash pages and old function tables are safely reclaimed after a grace period; zero leaks, zero UAFs.  
 - **Hardened stash memory** - isolated via `VirtualAlloc`, kept `PAGE_READONLY` or `PAGE_NOACCESS` at rest.  
-- **Debug toggles** - macros for inspection pauses and persistent decryption when needed.
 
 ---
 
@@ -64,9 +62,10 @@ Core features include:
 
 ---
 
-## Debug & Inspection
+## Debug and Development
 
-Because functions are re-encrypted almost instantly, inspection requires toggles defined in `SED.h`:
+Since this version re-encrypts functions in roughly 0.5 µs, viewing the decrypted code without an intentional delay is virtually impossible.
+To assist with debugging, two optional macros have been added at the top of SED.h that control re-encryption behavior:
 
 ```cpp
 #define SED_DEBUG_KEEP_DECRYPTED 0
@@ -80,34 +79,58 @@ Because functions are re-encrypted almost instantly, inspection requires toggles
 
 ---
 
-## Key Architecture
+## Key Improvements Over Original
+
+This version significantly enhances the original SED project with the following upgrades:
 
 ### 1. Hardened Memory Layout
-- Each function owns its own **encrypted stash** in a `VirtualAlloc` region.  
-- Stash is `PAGE_READONLY` at rest; decrypted only inside the VEH window.  
-- Live code pages are overwritten with random UD2 sleds after use.
+- Each protected function owns its own **encrypted stash** in a `VirtualAlloc` region.  
+- Stashes are `PAGE_READONLY` at rest and decrypted only during VEH handling.  
+- Live code pages are wiped after execution using randomized **UD2 sleds + junk patterns**, ensuring no static opcode signature remains.  
+- Every wipe uses a per-function RNG seed, so patterns differ on every cycle.
 
-### 2. Per-Cycle Stash Relocation
-- After each full execution cycle, the encrypted stash is cloned to a new address.  
-- The old stash is moved to a retired list with its epoch tag and freed safely once it’s older than one grace period.  
-- This ensures stealth rotation without leaking or racing memory.
+### 2. Per-Cycle Stash & Table Relocation (Epoch-Based GC)
+- After each full execution cycle, both the encrypted stash and its metadata table are cloned to new memory regions.  
+- The old versions are retired under a **grace epoch model**, guaranteeing zero use-after-free conditions.  
+- **Epoch-based garbage collection** safely frees both retired stash pages *and old tables* once they’re at least one generation old, ensuring fully leak-free operation.
 
-### 3. Stealth & Anti-Forensics
-- Re-wipes use evolving random seeds per function.  
-- No static wipe pattern; every cycle differs in both UD2 layout and junk sequence.  
-- Random noise breaks pattern-based opcode signatures completely.
+### 3. Multi-Thread & Lock-Free Safety
+- Thread safety is ensured through atomic `ActiveCalls` counters and a per-thread call stack (`g_tls_stack`).  
+- Global tables are published immutably (RCU-style), allowing readers to proceed without locks.  
+- All reclamation (stash and table rotation) runs atomically and safely even under heavy multithreaded load.  
 
-### 4. Multi-Thread + Lock-Free Safety
-- Atomic counters manage active threads.  
-- Thread-local call stacks (`g_tls_stack`) track active SED calls.  
-- No global locks - uses atomic table publication (RCU style).  
-- Stash rotations and epoch GC run fully atomically, safe even under 8+ threads.
+### 4. VEH Hardening & Runtime Sanity Checks
+- The Vectored Exception Handler verifies:
+  - Function size validity (`0 < size ≤ 64KB`)
+  - Instruction pointer alignment with the registered function start  
+- Prevents controlled-fault exploits or mid-body decrypts.  
+- Decryptions and re-encryptions are strictly bounded to valid function regions.
 
-### 5. VEH Hardening
-- Sanity checks ensure:
-  - Function size within bounds (≤64KB)  
-  - IP matches expected start (no mid-function jumps)  
-- Prevents controlled faults or partial decrypts.
+### 5. Optimized Performance & Debuggability
+- Re-encryption occurs only when the final thread exits a protected function.  
+- Minimizes redundant `VirtualProtect` and `FlushInstructionCache` calls for speed (~1 µs per full decrypt–execute–relock).  
+- Debug macros (`SED_DEBUG_KEEP_DECRYPTED`, `SED_DEBUG_SLEEP`) allow inspection pauses or persistent decryption for analysis.  
+- Extensive inline comments and section banners clarify lifecycle behavior and implementation intent.
+
+### 6. Validation & Testing
+- `run_concurrent_same()` and `run_concurrent_mixed()` for thread-safety stress tests.  
+- `run_stash_relocation_tests()` verifying generation increments and epoch-based reclamation.  
+- `run_break_reencrypt_churn()` simulating heavy churn to confirm stable re-encrypt/decrypt cycles.  
+- All tests must pass without crashes, leaks, or unmapped access under 8+ concurrent threads.
+
+## Comparison with Original
+
+| Feature | Original | This Version |
+|----------|-----------|--------------|
+| Thread Safety | No | Yes (Atomic + TLS) |
+| VEH Hardening | No | Yes (Sanity checks) |
+| Stash Relocation | No | Yes (Safe per-cycle relocation) |
+| Garbage Collection | No | Yes (Leak-free memory reclamation) |
+| Memory Wipe | Static 0x1F | Randomized UD2 + junk |
+| Debugging | None | Macros + inspection delay |
+| Performance | ~Slow | ~1-2µs per call |
+| Memory Safety | Partial | Full |
+| Locking | Global locks | Lock-free atomic RCU table |
 
 ---
 
@@ -128,34 +151,6 @@ return EndSED(returnValue);
 
 4. Build with C++17+ and `std::atomic` support.  
 5. Run the examples in `SED.cpp` to test.
-
----
-
-## Validation Suite
-
-SED ships with full internal tests:
-- `run_overhead_test_fast()` - microbenchmarks raw cycle cost.  
-- `run_concurrent_same()` / `run_concurrent_mixed()` - thread safety validation.  
-- `run_break_reencrypt_churn()` - churn race detection.  
-- `run_stash_relocation_tests()` - validates relocation, generation increments, epoch GC, and retired stash safety.  
-
-All tests must complete with no `0xC0000005` access violations, all retired stashes still mapped or safely reclaimed, and process exit code **0 (0x0)** under 8-thread churn.
-
----
-
-## Comparison with Original
-
-| Feature | Original | This Version |
-|----------|-----------|--------------|
-| Thread Safety | No | Yes (Atomic + TLS) |
-| VEH Hardening | No | Yes (Sanity checks) |
-| Stash Relocation | No | Yes (Safe per-cycle relocation) |
-| Garbage Collection | No | Yes (Leak-free memory reclamation) |
-| Memory Wipe | Static 0x1F | Randomized UD2 + junk |
-| Debugging | None | Macros + inspection delay |
-| Performance | ~Slow | ~1-2µs per call |
-| Memory Safety | Partial | Full |
-| Locking | Global locks | Lock-free atomic RCU table |
 
 ---
 
