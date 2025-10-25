@@ -54,7 +54,7 @@ SED protects sensitive code by dynamically encrypting and decrypting functions i
 **Before Encryption:**  
 ![Before](https://raw.githubusercontent.com/rewalo/Segment-Encryption-Decryption/main/Images/Before.png)
 
-**During Execution (Decrypted):**  
+**After Encryption**  
 ![After](https://raw.githubusercontent.com/rewalo/Segment-Encryption-Decryption/main/Images/After.png)
 
 **Sample Output:**  
