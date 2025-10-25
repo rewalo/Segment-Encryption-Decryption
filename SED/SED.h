@@ -1,9 +1,6 @@
 ﻿#pragma once
-#define _CRT_SECURE_NO_WARNINGS
-
 #include <Windows.h>
 #include <cstdint>
-#include <cstdarg>
 #include <cstddef>
 #include <atomic>
 #include <cstring>
@@ -11,73 +8,42 @@
 #include <vector>
 
 // ------------------------------------------------------------
-// Config / encryption settings
+// Configuration
 // ------------------------------------------------------------
-#define USE_XOR_ENCRYPTION 1
 
-// Debug knobs: slow or skip re-lock for inspection
-#define SED_DEBUG_KEEP_DECRYPTED 0  // 1 = EndSED() will NOT re-encrypt at exit
+// Eventually we might want to swap in a stronger crypto algorithm here.
+// For now, XOR is fine to demonstrate the concept, and extremely fast.
+#define USE_XOR_ENCRYPTION 1        // 0 = stash is left in plaintext. Useful for debugging, but this should never be used in production. (Obviously.)
+#define SED_DEBUG_KEEP_DECRYPTED 0  // 1 = EndSED() leaves code decrypted
 #define SED_DEBUG_SLEEP 0           // 1 = Sleep() before re-encrypting
 
 #if USE_XOR_ENCRYPTION
-// NOTE: xor_key is constexpr data in .rdata, never mutated.
+// xor_key is constexpr data in .rdata, never mutated. Eventually we might want to generate this per-build, or mutate it at runtime.
 static constexpr unsigned char xor_key[] =
 "YwAYwAonvsgHUbnoYwAonvsgHUbnnvsgHUbn";
 static constexpr size_t xor_key_size = sizeof(xor_key) - 1;
 #endif
 
 // ------------------------------------------------------------
-// Internal helpers / small RAII wrappers to reduce syscall cost
+// Scoped memory protection
 // ------------------------------------------------------------
-
-// VirtualProtect scope guard.
-// This avoids double VirtualProtect/Flush if the range is already RWX etc.
-// BUT we still always restore original prot to keep behavior identical.
-//
-// IMPORTANT: We *never* early-return in ctor so oldProt is always defined.
-//
-// NOTE: This is tiny and inline so cost is basically a couple branches; this
-// lets us consolidate VirtualProtect calls, which *are* expensive.
+// We temporarily flip page protection (executable -> writable, etc.)
+// and make sure it always gets restored when we leave the scope.
 class ScopedProtect final {
 public:
-    ScopedProtect(void* addr,
-        SIZE_T sizeBytes,
-        DWORD newProt) noexcept
-        : _addr(addr),
-        _size(sizeBytes),
-        _restoreNeeded(FALSE),
-        _oldProt(0) {
+    ScopedProtect(void* addr, SIZE_T sizeBytes, DWORD newProt) noexcept
+        : _addr(addr), _size(sizeBytes), _restoreNeeded(FALSE), _oldProt(0) {
+        if (!_addr || _size == 0) return;
 
-        if (_size == 0 || _addr == nullptr) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(_addr, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.Protect == newProt) {
+            _oldProt = mbi.Protect;
+            _restoreNeeded = TRUE;
             return;
         }
 
-        DWORD curProt = 0;
-        MEMORY_BASIC_INFORMATION mbi{};
-        // Query the first page. If the region is already RWX/etc, we can
-        // opportunistically skip the first VirtualProtect. We still must
-        // record original prot for restore. We do a single VirtualQuery
-        // here vs. always calling VirtualProtect unconditionally.
-        if (::VirtualQuery(_addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
-            curProt = mbi.Protect;
-        }
-
-        // If it's already the prot we want, we don't call VirtualProtect now.
-        // We still "restore" to curProt at dtor time (which is identical).
-        if (curProt == newProt) {
-            _oldProt = curProt;
-            _restoreNeeded = TRUE; // logically we "changed" it for symmetry
-        }
-        else {
-            if (::VirtualProtect(_addr, _size, newProt, &_oldProt)) {
-                _restoreNeeded = TRUE;
-            }
-            else {
-                // VirtualProtect failed -> leave _restoreNeeded = FALSE.
-                // Caller code should still behave safely even if protection
-                // wasn't applied. We keep _oldProt = 0.
-            }
-        }
+        if (::VirtualProtect(_addr, _size, newProt, &_oldProt))
+            _restoreNeeded = TRUE;
     }
 
     ~ScopedProtect() {
@@ -93,20 +59,21 @@ public:
 private:
     void* _addr;
     SIZE_T _size;
-    BOOL   _restoreNeeded;
-    DWORD  _oldProt;
+    BOOL _restoreNeeded;
+    DWORD _oldProt;
 };
 
 // ------------------------------------------------------------
-// Tiny PRNG (used to randomize wipe patterns)
+// Tiny RNG
 // ------------------------------------------------------------
+// Used to generate per-cycle wipe data so memory patterns never repeat. There's better ways to do this, but this is small and fast enough for our purposes.
 struct XorShift64 {
     uint64_t state;
     explicit XorShift64(uint64_t s) noexcept
         : state(s ? s : 0xdeadbeefcafebabeULL) {
     }
 
-    inline uint64_t next() noexcept {
+    uint64_t next() noexcept {
         uint64_t x = state;
         x ^= x >> 12;
         x ^= x << 25;
@@ -115,55 +82,69 @@ struct XorShift64 {
         return x * 0x2545F4914F6CDD1DULL;
     }
 
-    inline unsigned char nextByte() noexcept {
+    unsigned char nextByte() noexcept {
         return static_cast<unsigned char>(next() >> 56);
     }
 };
 
 // ------------------------------------------------------------
-// Forward decls for types referenced across the file
+// Core metadata types
 // ------------------------------------------------------------
-struct EncryptedFunctionEntry; // forward so RetiredTable can hold a pointer
 
-// ------------------------------------------------------------
-// Stash indirection + retire list + epoch GC
-// + table GC (RCU-ish, reclaimed after grace epoch)
-// ------------------------------------------------------------
+struct EncryptedFunctionEntry;
+
 struct StashHandle {
-    std::atomic<unsigned char*> ptr{ nullptr };
-    std::atomic<uint64_t>       generation{ 0 };
+    std::atomic<unsigned char*> ptr{ nullptr };  // where the encrypted copy lives
+    std::atomic<uint64_t> generation{ 0 };       // bump every time we move it
 };
 
 struct RetiredStash {
-    unsigned char* ptr;
+    unsigned char* ptr;                          // old stash VA
     size_t         size;
-    uint64_t       retireEpoch;
+    uint64_t       retireEpoch;                  // when we stopped using it
 };
 
 struct RetiredTable {
-    // old function metadata table we replaced with a new one
-    EncryptedFunctionEntry* ptr;
-    size_t                  count;       // number of entries in that table
+    EncryptedFunctionEntry* ptr;                 // old function table
+    size_t                  count;
     uint64_t                retireEpoch;
 };
 
-// Global epoch for deferred reclamation of stashes AND tables
-inline std::atomic<uint64_t> g_reclaimEpoch{ 1 };
+struct PendingRelock {
+    EncryptedFunctionEntry* fn;                 // which function needs to be wiped+rotated
+    uint64_t epochTagged;                       // when we queued it
+};
 
 // ------------------------------------------------------------
-// Per-function metadata
+// Global state
+// ------------------------------------------------------------
+// Everything below is effectively "the runtime." It's mostly
+// atomics + thread_local so we don't need global locks.
+
+inline std::atomic<uint64_t> g_reclaimEpoch{ 1 };               // global epoch counter
+inline std::vector<RetiredStash> g_retiredStashes;              // old stash pages to maybe free
+inline std::vector<RetiredTable> g_retiredTables;               // old metadata tables to maybe free
+inline std::vector<PendingRelock> g_pendingRelock;              // functions waiting to be relocked
+inline std::vector<PendingRelock> g_armedRelock;                // eligible to wipe on this / next GC tick
+inline std::atomic<EncryptedFunctionEntry*> g_table{ nullptr }; // current published table
+inline std::atomic<size_t> g_count{ 0 };                        // number of entries in that table
+inline std::atomic<bool> g_handlerReady{ false };               // VEH only installs once
+thread_local std::vector<EncryptedFunctionEntry*> g_tls_stack;  // what this thread is "inside"
+
+// ------------------------------------------------------------
+// Per-function info
 // ------------------------------------------------------------
 struct EncryptedFunctionEntry {
-    uintptr_t FunctionAddress;          // start of code region
-    uintptr_t ReturnAddress;            // CALL/JMP to EndSED inside func
-    int64_t   FunctionSize;             // size in bytes (<=64KB sane cap)
-    StashHandle stash;                  // encrypted stash VA + gen
-    BOOL      IsJMPReturn;              // legacy
-    std::atomic<int> ActiveCalls{ 0 };  // active threads in this function
-    uint64_t  seed{ 0 };                // wipe RNG seed (mutates per cycle)
+    uintptr_t FunctionAddress;          // address of the function's first byte
+    uintptr_t ReturnAddress;            // address of the CALL/JMP EndSED inside it
+    int64_t   FunctionSize;             // bytes from start -> EndSED call/jmp
+    StashHandle stash;                  // encrypted backup storage
+    BOOL      IsJMPReturn;              // whether EndSED was tailcalled (jmp) or normal call
+    std::atomic<int> ActiveCalls{ 0 };  // how many threads are currently executing it
+    uint64_t  seed{ 0 };                // per-function randomness seed for wipe patterns
 
-    EncryptedFunctionEntry() noexcept
-        : FunctionAddress(0),
+    EncryptedFunctionEntry() noexcept: 
+        FunctionAddress(0),
         ReturnAddress(0),
         FunctionSize(0),
         stash(),
@@ -174,74 +155,32 @@ struct EncryptedFunctionEntry {
 };
 
 // ------------------------------------------------------------
-// Global state
-// ------------------------------------------------------------
-
-// Retired stash pages (to VirtualFree after grace epoch)
-// NOTE: vector itself is not thread-safe. All mutation happens in places
-// where we have a "publish" moment and then bump global epoch immediately
-// after pushing, which is effectively single-writer: EncryptFunction() and
-// clone_stash_and_rotate() are called by user code, not async VEH path.
-// Reclaimers also run only from those same single-writer codepaths.
-inline std::vector<RetiredStash> g_retiredStashes;
-
-// Retired function tables (to HeapFree after grace epoch)
-inline std::vector<RetiredTable> g_retiredTables;
-
-// Global table of protected functions (append-only publish)
-// NOTE: EncryptFunction() allocates a fresh table that copies old entries +
-// new entry, then atomically swaps g_table/g_count. The previous table is
-// pushed into g_retiredTables with an epoch tag and reclaimed later.
-inline std::atomic<EncryptedFunctionEntry*> g_table{ nullptr };
-inline std::atomic<size_t> g_count{ 0 };
-inline std::atomic<bool> g_handlerReady{ false };
-
-// TLS call stack (tracks current function for this thread)
-thread_local std::vector<EncryptedFunctionEntry*> g_tls_stack;
-
-// ------------------------------------------------------------
 // Public API
 // ------------------------------------------------------------
-
-// NOTE: Assumes target is __cdecl-like: first param is ignored "context".
-// This keeps behavior identical to original.
-template <typename Fn, typename... Args>
-inline void* CallFunction(Fn fn, Args... args) {
-    using FnType = void* (__cdecl*)(void*, Args...);
-    return reinterpret_cast<FnType>(fn)(
-        nullptr, std::forward<Args>(args)...);
-}
-
-__declspec(noinline) void* CallFunction(void* ptr, ...);
+// Every protected function must end with EndSED(...) instead of return.
+// EncryptFunction(fn) sets up protection for that function.
 __declspec(dllexport) void* EndSED(void* returnValue);
-__declspec(noinline) void EncryptFunction(uintptr_t functionPointer);
+void EncryptFunction(uintptr_t functionPointer);
 
 // ------------------------------------------------------------
-// XOR encrypt/decrypt helper
-// Symmetric XOR, used for stash-at-rest protection.
+// Light crypto / memory scribble helpers
 // ------------------------------------------------------------
+
 #if USE_XOR_ENCRYPTION
+// Basic XOR over the stash buffer. This is symmetrical: xor twice to get back plaintext.
 inline void xor_crypt(unsigned char* data, size_t len) {
-    // NOTE: We assume data != nullptr and len > 0 for all callers.
     for (size_t i = 0; i < len; ++i)
         data[i] ^= xor_key[i % xor_key_size];
 }
 #endif
 
-// ------------------------------------------------------------
-// generate_random_wipe
-// UD2 sled + junk, and mutate 'seed' so pattern changes each cycle
-// ------------------------------------------------------------
-inline void generate_random_wipe(unsigned char* buffer,
-    size_t size,
-    uint64_t& seed) {
-    if (!buffer || size == 0) {
-        return;
-    }
+// Build a "wipe" image of the function: first bytes are UD2 (0F 0B = illegal instr),
+// rest is random junk. Seed changes every cycle so nothing repeats.
+inline void generate_random_wipe(unsigned char* buffer, size_t size, uint64_t& seed) {
+    if (!buffer || size == 0) return;
 
     XorShift64 rng(seed);
 
-    // First bytes = UD2 sled (0F 0B). Forces immediate fault when executed.
     const size_t ud2_len = (size >= 16u) ? 16u : size;
     for (size_t i = 0; i < ud2_len; i += 2) {
         buffer[i] = 0x0F;
@@ -249,109 +188,83 @@ inline void generate_random_wipe(unsigned char* buffer,
             buffer[i + 1] = 0x0B;
     }
 
-    // Remainder = random junk (no obvious "all 0x1F" sig)
     for (size_t i = ud2_len; i < size; ++i)
         buffer[i] = rng.nextByte();
 
-    // Evolve the seed so next wipe differs too
-    seed = rng.next();
+    seed = rng.next(); // evolve per cycle
 }
 
-// ------------------------------------------------------------
-// SecureMemcpyCode
-// Writes wipe/decrypted bytes into live code (RX) region.
-// We consolidate RW flip/restore + cache flush here.
-//
-// We try to avoid duplicated VirtualProtect calls up the stack, so both
-// WipeLiveCodeSection() and VEHDecryptionHandler() use this for the
-// code write step.
-// ------------------------------------------------------------
-inline void SecureMemcpyCode(void* dst,
-    const void* src,
-    size_t sizeBytes) {
-    if (!dst || !src || sizeBytes == 0)
-        return;
-
-    // RWX scope (or RW on code, same as caller used before).
+// Copy into executable memory safely, and flush instruction cache so CPUs see updated bytes.
+inline void SecureMemcpyCode(void* dst, const void* src, size_t sizeBytes) {
+    if (!dst || !src || sizeBytes == 0) return;
     ScopedProtect prot(dst, sizeBytes, PAGE_EXECUTE_READWRITE);
-
-    // memcpy is unavoidable here (we're literally restoring bytes).
     std::memcpy(dst, src, sizeBytes);
-
-    // Make sure all cores see fresh bytes.
     ::FlushInstructionCache(::GetCurrentProcess(), dst, sizeBytes);
 }
 
-// ------------------------------------------------------------
-// WipeLiveCodeSection
-// Flip RX->RW, write UD2/junk, restore original prot
-// ------------------------------------------------------------
-__declspec(noinline) inline void WipeLiveCodeSection(
-    LPVOID address,
-    int SIZE_OF_FUNCTION,
-    uint64_t& seed) {
-
-    if (!address || SIZE_OF_FUNCTION <= 0) {
-        return;
-    }
+// Overwrite live code bytes with UD2 + random junk.
+// After this, trying to execute that function will immediately fault.
+inline void WipeLiveCodeSection(LPVOID address, int SIZE_OF_FUNCTION, uint64_t& seed) {
+    if (!address || SIZE_OF_FUNCTION <= 0) return;
 
     const size_t sz = static_cast<size_t>(SIZE_OF_FUNCTION);
 
-    // Build wipe pattern on stack for small funcs, heap for large.
-    // This avoids always allocating a std::vector and reduces heap churn.
-    // We cap "small" as 512 bytes which covers a lot of leaf funcs.
     constexpr size_t SMALL_SCRATCH = 512;
     unsigned char smallBuf[SMALL_SCRATCH];
-    unsigned char* wipeBuf = nullptr;
 
-    if (sz <= SMALL_SCRATCH) {
-        wipeBuf = smallBuf;
-    }
-    else {
-        // fallback heap alloc. If this fails we just bail gracefully.
-        wipeBuf = static_cast<unsigned char*>(
-            ::HeapAlloc(::GetProcessHeap(), 0, sz));
-        if (!wipeBuf) {
-            return;
-        }
-    }
+    unsigned char* wipeBuf =
+        (sz <= SMALL_SCRATCH)
+        ? smallBuf
+        : static_cast<unsigned char*>(::HeapAlloc(::GetProcessHeap(), 0, sz));
+
+    if (!wipeBuf) return;
 
     generate_random_wipe(wipeBuf, sz, seed);
-
     SecureMemcpyCode(address, wipeBuf, sz);
 
-    if (sz > SMALL_SCRATCH) {
+    if (sz > SMALL_SCRATCH)
         ::HeapFree(::GetProcessHeap(), 0, wipeBuf);
-    }
 }
 
 // ------------------------------------------------------------
-// ReclaimRetiredStashes
-// Free stash pages whose retireEpoch is strictly older than (curEpoch - 1).
-// We keep the newest epoch's pages around for one grace window so VEH
-// can't race reading a just-freed stash.
+// Reclaim helpers
 // ------------------------------------------------------------
-__declspec(noinline) inline void ReclaimRetiredStashes() {
+// We don't free memory the instant we're "done" with it.
+// Instead, we tag it with an epoch and only release it after a grace period.
+// This prevents use-after-free in other threads that might still be exiting.
+inline void ReclaimRetiredStashes() {
     const uint64_t curEpoch = g_reclaimEpoch.load(std::memory_order_acquire);
-
-    // Oldest epoch we're NOT allowed to touch yet
-    // Example:
-    //   curEpoch = 7
-    //   minKeepEpoch = 6
-    //   any stash with retireEpoch < 6 is now fair to free
-    const uint64_t minKeepEpoch = (curEpoch > 1u) ? (curEpoch - 1u) : 0u;
+    const uint64_t minKeepEpoch = (curEpoch > 2u) ? (curEpoch - 2u) : 0u;
 
     std::vector<RetiredStash> keep;
     keep.reserve(g_retiredStashes.size());
 
     for (auto& r : g_retiredStashes) {
-        if (r.ptr == nullptr || r.size == 0) {
-            // Nothing meaningful to free; drop it.
-            continue;
+        if (!r.ptr || r.size == 0) continue;
+
+        bool stillActiveUser = false;
+
+        auto* tbl = g_table.load(std::memory_order_acquire);
+        const size_t cnt = g_count.load(std::memory_order_acquire);
+
+        if (tbl && cnt) {
+            for (size_t i = 0; i < cnt; ++i) {
+                // If some function is still using this exact stash AND it's active,
+                // we definitely can't free that memory yet.
+                if (tbl[i].stash.ptr.load(std::memory_order_acquire) == r.ptr &&
+                    tbl[i].ActiveCalls.load(std::memory_order_acquire) > 0) {
+                    stillActiveUser = true;
+                    break;
+                }
+            }
         }
 
-        if (r.retireEpoch < minKeepEpoch) {
-            ::VirtualFree(r.ptr, 0, MEM_RELEASE);
+        if (r.retireEpoch < minKeepEpoch && !stillActiveUser) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(r.ptr, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+                mbi.State == MEM_COMMIT) {
+                ::VirtualFree(r.ptr, 0, MEM_RELEASE);
+            }
         }
         else {
             keep.push_back(r);
@@ -361,24 +274,15 @@ __declspec(noinline) inline void ReclaimRetiredStashes() {
     g_retiredStashes.swap(keep);
 }
 
-// ------------------------------------------------------------
-// ReclaimRetiredTables
-// Any table whose retireEpoch is strictly older than (curEpoch - 1) is freed.
-// Just like stashes, we always leave at least one epoch of grace in case a
-// VEH handler on another core is still iterating an older snapshot.
-// ------------------------------------------------------------
-__declspec(noinline) inline void ReclaimRetiredTables() {
+inline void ReclaimRetiredTables() {
     const uint64_t curEpoch = g_reclaimEpoch.load(std::memory_order_acquire);
-    const uint64_t minKeepEpoch = (curEpoch > 1u) ? (curEpoch - 1u) : 0u;
+    const uint64_t minKeepEpoch = (curEpoch > 2u) ? (curEpoch - 2u) : 0u;
 
     std::vector<RetiredTable> keep;
     keep.reserve(g_retiredTables.size());
 
     for (auto& t : g_retiredTables) {
-        if (!t.ptr || t.count == 0) {
-            // Nothing to free.
-            continue;
-        }
+        if (!t.ptr || t.count == 0) continue;
 
         if (t.retireEpoch < minKeepEpoch) {
             ::HeapFree(::GetProcessHeap(), 0, t.ptr);
@@ -392,223 +296,225 @@ __declspec(noinline) inline void ReclaimRetiredTables() {
 }
 
 // ------------------------------------------------------------
-// GlobalReclaim()
-// Helper: run both reclaim passes. We centralize this so any code path
-// that advances epochs (stash rotation, table publish) can invoke it.
+// Relock / rotation
 // ------------------------------------------------------------
-__declspec(noinline) inline void GlobalReclaim() {
+// After the last thread leaves a function, we don't instantly nuke it.
+// We push it into a "pending relock" list instead, then later (after a grace
+// period) we actually wipe the live code again and move its stash to a new VA.
+// That relocation step helps break long-term memory forensics.
+
+inline void do_rotation_now(EncryptedFunctionEntry* e) {
+    if (!e) return;
+
+#if SED_DEBUG_SLEEP
+    ::Sleep(5000); // helpful when debugging / reversing
+#endif
+
+#if !SED_DEBUG_KEEP_DECRYPTED
+    // Put illegal opcodes + junk back into the live code region.
+    WipeLiveCodeSection(reinterpret_cast<LPVOID>(e->FunctionAddress),
+        static_cast<int>(e->FunctionSize),
+        e->seed);
+#endif
+
+    const size_t sz = static_cast<size_t>(e->FunctionSize);
+    if (sz == 0) return;
+
+    unsigned char* oldPtr = e->stash.ptr.load(std::memory_order_acquire);
+    if (!oldPtr) return;
+
+    // Allocate a brand new stash VA and copy the encrypted bytes over.
+    unsigned char* newPtr = static_cast<unsigned char*>(
+        ::VirtualAlloc(nullptr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!newPtr) return;
+
+    std::memcpy(newPtr, oldPtr, sz);
+
+    // Lock it back down as read-only so nobody writes into it.
+    DWORD tmp;
+    ::VirtualProtect(newPtr, sz, PAGE_READONLY, &tmp);
+
+    // Publish the new stash pointer and bump its generation counter.
+    e->stash.ptr.store(newPtr, std::memory_order_release);
+    (void)e->stash.generation.fetch_add(1, std::memory_order_acq_rel);
+
+    // The old stash memory goes onto the retired list to be freed later.
+    const uint64_t retireEpoch = g_reclaimEpoch.load(std::memory_order_acquire);
+    g_retiredStashes.push_back(RetiredStash{ oldPtr, sz, retireEpoch });
+}
+
+// This function is our "maintenance tick":
+inline void ProcessPendingRelocksAndGC() {
+    // bump global epoch
+    const uint64_t newEpoch =
+        g_reclaimEpoch.fetch_add(1, std::memory_order_acq_rel) + 1ULL;
+
+    const uint64_t minRelockEpoch =
+        (newEpoch > 2u) ? (newEpoch - 2u) : 0u;
+
+    // ----------------------------------------
+    // Stage A: move fresh idle functions from pending -> armed
+    // We do NOT wipe them yet. We just "arm" them.
+    // ----------------------------------------
+    {
+        std::vector<PendingRelock> stillPending;
+        stillPending.reserve(g_pendingRelock.size());
+
+        for (auto& pr : g_pendingRelock) {
+            if (!pr.fn)
+                continue;
+
+            // only care about funcs that are fully idle
+            const bool idleNow =
+                (pr.fn->ActiveCalls.load(std::memory_order_acquire) == 0);
+
+            if (idleNow) {
+                // arm it for future wipe (keep original epochTagged)
+                g_armedRelock.push_back(pr);
+            }
+            else {
+                // someone went back in, keep waiting
+                stillPending.push_back(pr);
+            }
+        }
+
+        g_pendingRelock.swap(stillPending);
+    }
+
+    // ----------------------------------------
+    // Stage B: actually wipe/rotate anything in armedRelock
+    // that is old enough and still idle.
+    //
+    // This cannot run in the same logical "frame" that just
+    // executed the function unless we've ticked at least once,
+    // which is what avoids the crash.
+    // ----------------------------------------
+    {
+        std::vector<PendingRelock> stillArmed;
+        stillArmed.reserve(g_armedRelock.size());
+
+        for (auto& pr : g_armedRelock) {
+            if (!pr.fn) continue;
+
+            const bool safeNow =
+                (pr.epochTagged < minRelockEpoch) &&
+                (pr.fn->ActiveCalls.load(std::memory_order_acquire) == 0);
+
+            if (safeNow) {
+                do_rotation_now(pr.fn); // wipes code + rotates stash
+            }
+            else {
+                stillArmed.push_back(pr);
+            }
+        }
+
+        g_armedRelock.swap(stillArmed);
+    }
+
+    // normal cleanup of old memory
     ReclaimRetiredStashes();
     ReclaimRetiredTables();
 }
 
 // ------------------------------------------------------------
-// clone_stash_and_rotate
-// Called when ActiveCalls hits 0 for this function.
-//  - Clone encrypted stash to new VA (RO).
-//  - Publish new ptr/gen.
-//  - Retire old ptr with an epoch tag.
-//  - Bump global epoch AFTER tracking retirement.
-//  - GC runs (may free really old retired stashes / tables).
-// NOTE: we never leave a just-retired stash/table in "freed" state during the
-// same epoch, so VEH can't race a freed resource.
+// VEH (Vectored Exception Handler)
 // ------------------------------------------------------------
-__declspec(noinline) inline void clone_stash_and_rotate(EncryptedFunctionEntry* e) {
-    if (!e) return;
-
-    const size_t sz = static_cast<size_t>(e->FunctionSize);
-    if (sz == 0)
-        return;
-
-    unsigned char* oldPtr = e->stash.ptr.load(std::memory_order_acquire);
-    if (!oldPtr)
-        return;
-
-    // New stash VA (RW temp)
-    unsigned char* newPtr = static_cast<unsigned char*>(
-        ::VirtualAlloc(nullptr,
-            sz,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE));
-    if (!newPtr)
-        return;
-
-    // Copy ciphertext (stash stays encrypted-at-rest)
-    std::memcpy(newPtr, oldPtr, sz);
-
-    {
-        // Lock new stash RO. (ScopedProtect not used here because we want
-        // final prot to be PAGE_READONLY, not restore. One call only.)
-        DWORD dummyProt;
-        ::VirtualProtect(newPtr,
-            sz,
-            PAGE_READONLY,
-            &dummyProt);
-    }
-
-    // Swap in new stash for future decrypts.
-    e->stash.ptr.store(newPtr, std::memory_order_release);
-    (void)e->stash.generation.fetch_add(1, std::memory_order_acq_rel);
-
-    // Retire old one. We snapshot the current epoch state BEFORE we bump it.
-    // This guarantees retiredStash.retireEpoch <= future curEpoch.
-    const uint64_t retireEpoch = g_reclaimEpoch.load(std::memory_order_acquire);
-
-    g_retiredStashes.push_back(
-        RetiredStash{ oldPtr, sz, retireEpoch });
-
-    // Now advance global epoch (new logical "cycle")
-    (void)g_reclaimEpoch.fetch_add(1, std::memory_order_acq_rel);
-
-    // Try to free anything old enough (stashes + tables)
-    GlobalReclaim();
-}
-
-// ------------------------------------------------------------
-// EndSED
-// Thread exits protected fn. If last thread out:
-//  - wipe live code -> UD2/junk
-//  - rotate stash (stash ptr churns, old ptr epoch-retired)
-//  - GC runs (may free really old retired stashes / tables)
-// ------------------------------------------------------------
-#pragma optimize("", off)
-__declspec(dllexport) inline void* EndSED(void* returnValue) {
-    if (!g_tls_stack.empty()) {
-        EncryptedFunctionEntry* e = g_tls_stack.back();
-        g_tls_stack.pop_back();
-
-        if (e) {
-            const int remaining =
-                e->ActiveCalls.fetch_sub(1, std::memory_order_acq_rel) - 1;
-
-            if (remaining == 0) {
-#if SED_DEBUG_SLEEP
-                ::Sleep(5000);
-#endif
-#if !SED_DEBUG_KEEP_DECRYPTED
-                WipeLiveCodeSection(reinterpret_cast<LPVOID>(e->FunctionAddress),
-                    static_cast<int>(e->FunctionSize),
-                    e->seed);
-#endif
-                clone_stash_and_rotate(e);
-            }
-        }
-    }
-    return returnValue;
-}
-#pragma optimize("", on)
-
-// ------------------------------------------------------------
-// VEHDecryptionHandler
-// Fault on UD2 -> decrypt function into place, bump ActiveCalls, resume.
-// Hardening:
-//  - size sanity (0 < size <= 64KB)
-//  - RIP must equal recorded FunctionAddress (block mid-body jumps)
-//  - stash is RO encrypted except brief RW/plaintext window here
-//
-// NOTE: We intentionally don't hold any global locks here because VEH runs
-// under async exception context. We rely on epoch grace to keep g_table and
-// stash memory valid long enough even if EncryptFunction() is racing.
-// ------------------------------------------------------------
-__declspec(noinline) inline LONG WINAPI VEHDecryptionHandler(PEXCEPTION_POINTERS exceptions) {
-    if (!exceptions || !exceptions->ExceptionRecord) {
+// The idea: the function is wiped with UD2, so executing it triggers
+// an illegal-instruction exception. We catch that here, decrypt the
+// bytes back into place, and then continue execution like nothing happened.
+inline LONG WINAPI VEHDecryptionHandler(PEXCEPTION_POINTERS ex) {
+    if (!ex || !ex->ExceptionRecord)
         return EXCEPTION_CONTINUE_SEARCH;
-    }
 
-    const auto code = exceptions->ExceptionRecord->ExceptionCode;
+    if (ex->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION)
+        return EXCEPTION_CONTINUE_SEARCH;
+
     auto* table = g_table.load(std::memory_order_acquire);
     const size_t count = g_count.load(std::memory_order_acquire);
-    if (!table || count == 0) return EXCEPTION_CONTINUE_SEARCH;
+    if (!table || count == 0)
+        return EXCEPTION_CONTINUE_SEARCH;
 
-    if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
-        const auto faultIP =
-            reinterpret_cast<uintptr_t>(exceptions->ExceptionRecord->ExceptionAddress);
+    const auto faultIP =
+        reinterpret_cast<uintptr_t>(ex->ExceptionRecord->ExceptionAddress);
 
-        // Linear scan of active entries. We keep this simple because count
-        // is expected to be small. If we ever have thousands+ of protected
-        // fns we can multilevel-index later.
-        for (size_t i = 0; i < count; ++i) {
-            EncryptedFunctionEntry& e = table[i];
+    for (size_t i = 0; i < count; ++i) {
+        EncryptedFunctionEntry& e = table[i];
 
-            // sanity check (#5)
-            const int64_t fnSize = e.FunctionSize;
-            if (fnSize <= 0 || fnSize > 0x10000)
-                continue;
-            if (faultIP != e.FunctionAddress)
-                continue;
+        if (e.FunctionSize <= 0 || e.FunctionSize > 0x10000)
+            continue;
 
-            const int prev =
-                e.ActiveCalls.fetch_add(1, std::memory_order_acq_rel);
+        if (faultIP != e.FunctionAddress)
+            continue;
 
-            if (prev == 0) {
-                // First thread in: restore function bytes from stash.
-                const size_t sz = static_cast<size_t>(fnSize);
+        // First thread in restores plaintext from stash.
+        const int prev =
+            e.ActiveCalls.fetch_add(1, std::memory_order_acq_rel);
 
-                unsigned char* stashPtr =
-                    e.stash.ptr.load(std::memory_order_acquire);
-                if (stashPtr && sz != 0) {
+        if (prev == 0) {
+            const size_t sz = static_cast<size_t>(e.FunctionSize);
+            unsigned char* stashPtr =
+                e.stash.ptr.load(std::memory_order_acquire);
 
-                    // Temporarily RW the stash so we can decrypt.
-                    {
-                        ScopedProtect stashProt(
-                            stashPtr, sz, PAGE_READWRITE);
+            if (stashPtr && sz) {
+                // Quick sanity check that memory is still valid and hasn't already
+                // been freed by GC.
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (::VirtualQuery(stashPtr, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+                    mbi.State != MEM_COMMIT) {
 
-#if USE_XOR_ENCRYPTION
-                        xor_crypt(stashPtr, sz); // -> plaintext
-#endif
-                        // Copy plaintext into RX function memory.
-                        SecureMemcpyCode(
-                            reinterpret_cast<void*>(e.FunctionAddress),
-                            stashPtr,
-                            sz);
-
-#if USE_XOR_ENCRYPTION
-                        xor_crypt(stashPtr, sz); // -> re-encrypt
-#endif
-                        // stashProt dtor restores PAGE_READONLY (or whatever
-                        // original was) for that region.
-                    }
+                    // Stash is gone (shouldn't normally happen, but if it does,
+                    // back out so we don't crash this thread immediately).
+                    e.ActiveCalls.fetch_sub(1, std::memory_order_acq_rel);
+                    return EXCEPTION_CONTINUE_SEARCH;
                 }
+
+                // Temporarily allow writes to the stash so we can decrypt in place.
+                ScopedProtect stashProt(stashPtr, sz, PAGE_READWRITE);
+
+#if USE_XOR_ENCRYPTION
+                xor_crypt(stashPtr, sz); // decrypt in-place
+#endif
+
+                // Copy plaintext back over the live function bytes.
+                SecureMemcpyCode(
+                    reinterpret_cast<void*>(e.FunctionAddress),
+                    stashPtr,
+                    sz);
+
+#if USE_XOR_ENCRYPTION
+                xor_crypt(stashPtr, sz); // re-encrypt it before we leave
+#endif
             }
-
-            // mark this thread as "inside" this protected fn
-            g_tls_stack.push_back(&e);
-
-            return EXCEPTION_CONTINUE_EXECUTION;
         }
+
+        // Track that this thread is "inside" this protected function now.
+        g_tls_stack.push_back(&e);
+
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
 // ------------------------------------------------------------
-// EnsureVEHInstalled
+// VEH install
 // ------------------------------------------------------------
-__declspec(noinline) inline void EnsureVEHInstalled() {
+// We only want to install the vectored exception handler once.
+inline void EnsureVEHInstalled() {
     bool expected = false;
     if (g_handlerReady.compare_exchange_strong(
         expected, true, std::memory_order_acq_rel)) {
 
-        // NOTE: AddVectoredExceptionHandler returns a handle. We don't
-        // remove it for process lifetime, which is fine because SED is
-        // logically a persistent facility. Store not needed ATM.
         ::AddVectoredExceptionHandler(1, &VEHDecryptionHandler);
     }
 }
 
 // ------------------------------------------------------------
-// AnalyzeFunctionForEndSED
-// Scan forward until CALL/JMP EndSED is found. Cap 64KB to avoid runaway.
-// NOTE: if the body is *extremely* tiny, some builds can tailcall/jmp EndSED
-// in a way that still hits our pattern. If FunctionSize ends up 0 here, that
-// function won't rotate stash (clone_stash_and_rotate() early-outs on sz==0).
-// We pad testFast() in tests so size > 0.
-//
-// We use VirtualQuery() to make sure we don't walk into an
-// invalid/unmapped page. This prevents accidental AV if someone passes an
-// arbitrary address to EncryptFunction() that spans multiple regions.
+// Function analysis
 // ------------------------------------------------------------
-__declspec(noinline) inline bool AnalyzeFunctionForEndSED(uintptr_t fn,
-    EncryptedFunctionEntry& out) {
+// We walk the function bytes looking for the CALL/JMP to EndSED.
+// That gives us the "real" size we need to protect.
+inline bool AnalyzeFunctionForEndSED(uintptr_t fn, EncryptedFunctionEntry& out) {
     if (!fn)
         return false;
 
@@ -616,21 +522,20 @@ __declspec(noinline) inline bool AnalyzeFunctionForEndSED(uintptr_t fn,
     int size = 0;
 
     MEMORY_BASIC_INFORMATION mbi{};
-    const SIZE_T qres = ::VirtualQuery(p, &mbi, sizeof(mbi));
-    if (qres != sizeof(mbi))
+    if (::VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi))
         return false;
 
-    // Limit scan to at most 64KB OR current region size, whichever is smaller.
-    const unsigned char* regionEnd =
-        reinterpret_cast<unsigned char*>(mbi.BaseAddress) + mbi.RegionSize;
-    const SIZE_T region_remaining = static_cast<SIZE_T>(regionEnd - p);
-    const int maxScan = static_cast<int>(
-        (region_remaining < 0x10000 ? region_remaining : 0x10000));
+    const SIZE_T region_remaining =
+        (reinterpret_cast<unsigned char*>(mbi.BaseAddress) + mbi.RegionSize) - p;
+
+    const int maxScan =
+        static_cast<int>((region_remaining < 0x10000 ? region_remaining : 0x10000));
 
     while (size < maxScan) {
         unsigned char op = *p;
 
-        if (op == 0xE8 || op == 0xE9) { // CALL or JMP rel32
+        // Rel32 CALL (E8) or JMP (E9)
+        if (op == 0xE8 || op == 0xE9) {
             auto rel = *reinterpret_cast<const int32_t*>(p + 1);
             uintptr_t target = reinterpret_cast<uintptr_t>(p + 5) + rel;
 
@@ -651,10 +556,11 @@ __declspec(noinline) inline bool AnalyzeFunctionForEndSED(uintptr_t fn,
 
 // ------------------------------------------------------------
 // EncryptFunction
-// Install VEH if needed, append new entry, stash encrypted bytes in
-// private VA (RO), wipe live code with UD2/junk so first call faults.
 // ------------------------------------------------------------
-__declspec(noinline) inline void EncryptFunction(uintptr_t functionPointer) {
+// Called once per function you want protected.
+// After this, executing that function will fault, decrypt itself on demand,
+// run, then get wiped and rotated again later.
+inline void EncryptFunction(uintptr_t functionPointer) {
     if (!functionPointer)
         return;
 
@@ -667,43 +573,38 @@ __declspec(noinline) inline void EncryptFunction(uintptr_t functionPointer) {
 
     const size_t newCount = oldCount + 1u;
 
-    // Allocate new table (immutable snapshot publish).
+    // Publish a brand new copy of the table (RCU style).
     EncryptedFunctionEntry* newTable =
         static_cast<EncryptedFunctionEntry*>(
             ::HeapAlloc(::GetProcessHeap(),
                 HEAP_ZERO_MEMORY,
                 newCount * sizeof(EncryptedFunctionEntry)));
-
     if (!newTable) {
-        // Allocation failed -> nothing we can do, leave as-is.
         return;
     }
 
-    // Copy old table entries first (if any).
     if (oldTable && oldCount) {
         std::memcpy(newTable,
             oldTable,
             oldCount * sizeof(EncryptedFunctionEntry));
     }
 
-    // Fill in new entry at end.
     EncryptedFunctionEntry& cur = newTable[newCount - 1u];
     cur.FunctionAddress = functionPointer;
 
+    // Figure out how big the function body actually is.
     if (!AnalyzeFunctionForEndSED(functionPointer, cur)) {
         ::HeapFree(::GetProcessHeap(), 0, newTable);
         return;
     }
 
-    // init per-function wipe RNG
+    // Seed for wipe pattern randomization.
     cur.seed = static_cast<uint64_t>(functionPointer) ^ __rdtsc();
 
     const size_t sz = static_cast<size_t>(cur.FunctionSize);
 
-    // If size==0 (e.g. weird leaf that tail-jumps EndSED immediately),
-    // we still publish it (to catch faults!) but we skip stash alloc.
     if (sz != 0u) {
-        // private stash VA (encrypted at rest, RO at rest)
+        // Allocate stash memory for the encrypted copy.
         unsigned char* stash = static_cast<unsigned char*>(
             ::VirtualAlloc(nullptr,
                 sz,
@@ -714,41 +615,41 @@ __declspec(noinline) inline void EncryptFunction(uintptr_t functionPointer) {
             return;
         }
 
+        // Copy original function bytes to stash, then encrypt in place.
         std::memcpy(stash,
             reinterpret_cast<void*>(cur.FunctionAddress),
             sz);
 
 #if USE_XOR_ENCRYPTION
-        xor_crypt(stash, sz); // encrypt stash copy
+        xor_crypt(stash, sz); // stash now holds ciphertext
 #endif
 
-        // Set stash PAGE_READONLY for rest state.
-        {
-            DWORD oldProt;
-            ::VirtualProtect(stash,
-                sz,
-                PAGE_READONLY,
-                &oldProt);
-        }
+        // Stash lives read-only when idle.
+        DWORD oldProt;
+        ::VirtualProtect(stash,
+            sz,
+            PAGE_READONLY,
+            &oldProt);
 
         cur.stash.ptr.store(stash, std::memory_order_release);
         cur.stash.generation.store(0, std::memory_order_release);
 
-        // wipe live code so first execution traps into VEH
+        // Now wipe the live code with UD2/junk so first execution will fault.
         WipeLiveCodeSection(reinterpret_cast<LPVOID>(cur.FunctionAddress),
             static_cast<int>(cur.FunctionSize),
             cur.seed);
     }
     else {
+        // Extremely tiny leaf bodies can technically hit size==0. We still publish them.
         cur.stash.ptr.store(nullptr, std::memory_order_release);
         cur.stash.generation.store(0, std::memory_order_release);
     }
 
-    // publish new table (We never edit old table in-place)
+    // Publish the new table atomically.
     g_table.store(newTable, std::memory_order_release);
     g_count.store(newCount, std::memory_order_release);
 
-    // retire old table (if any) with current epoch snapshot
+    // The previous table (if any) becomes "retired" and will be freed after a grace period.
     if (oldTable && oldCount) {
         const uint64_t retireEpoch =
             g_reclaimEpoch.load(std::memory_order_acquire);
@@ -756,21 +657,41 @@ __declspec(noinline) inline void EncryptFunction(uintptr_t functionPointer) {
             RetiredTable{ oldTable, oldCount, retireEpoch });
     }
 
-    // Advance epoch for this structural mutation, then try to reclaim anything
-    // sufficiently old (both retired stashes and retired tables).
-    (void)g_reclaimEpoch.fetch_add(1, std::memory_order_acq_rel);
-    GlobalReclaim();
+    // Run maintenance: bump epoch, maybe relock old functions, maybe free old memory.
+    ProcessPendingRelocksAndGC();
 }
 
 // ------------------------------------------------------------
-// CallFunction (varargs helper for C ABI style fns)
+// EndSED
 // ------------------------------------------------------------
-__declspec(noinline) inline void* CallFunction(void* ptr, ...) {
-    if (!ptr) return nullptr;
+// Every SED-protected function must return through here, not `return <value>`.
+// We pop this thread's active function, drop ActiveCalls, and maybe schedule
+// a relock for that function.
+#pragma optimize("", off)
+inline void* EndSED(void* returnValue) {
+    if (!g_tls_stack.empty()) {
+        EncryptedFunctionEntry* e = g_tls_stack.back();
+        g_tls_stack.pop_back();
 
-    va_list ap;
-    va_start(ap, ptr);
-    void* ret = reinterpret_cast<void* (*)(va_list)>(ptr)(ap);
-    va_end(ap);
-    return ret;
+        if (e) {
+            const int remaining =
+                e->ActiveCalls.fetch_sub(1, std::memory_order_acq_rel) - 1;
+
+            if (remaining == 0) {
+                // last thread just left this function
+                // we do NOT wipe here. we just mark it "pending"
+                const uint64_t nowEpoch =
+                    g_reclaimEpoch.load(std::memory_order_acquire);
+
+                g_pendingRelock.push_back(
+                    PendingRelock{ e, nowEpoch });
+
+                // tiny nudge so epochs still advance under light usage
+                ProcessPendingRelocksAndGC();
+            }
+        }
+    }
+
+    return returnValue;
 }
+#pragma optimize("", on)
