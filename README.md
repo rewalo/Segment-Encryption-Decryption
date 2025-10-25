@@ -69,7 +69,7 @@ To assist with debugging, two optional macros have been added at the top of SED.
 
 ```cpp
 #define SED_DEBUG_KEEP_DECRYPTED 0
-#define SED_DEBUG_SLEEP 1
+#define SED_DEBUG_SLEEP 0
 ```
 
 | Macro | Description |
