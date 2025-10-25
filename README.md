@@ -4,7 +4,6 @@
 This is a complete modern rearchitecture of [**C5Hackr’s original Segment-Encryption (SED)**](https://github.com/C5Hackr/Segment-Encryption).
 
 All credit for the original concept and proof-of-concept implementation goes to [**C5Hackr**](https://github.com/C5Hackr).  
-This version re-imagines the system with hardened runtime protection, multi-thread safety, stash relocation, and epoch-based memory reclamation for leak-free safety.
 
 **If you find this project useful, please star the repository to support further development!**
 
